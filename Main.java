@@ -6,6 +6,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -21,8 +22,11 @@ public class Main {
     // Doors with "in + out" readers (per site_description.md); every other door is entry-only with a push-bar exit, so leaving does not require a badge.
     private static final Set<String> IN_OUT_DOORS = Set.of("D01", "D02", "D03", "D17");
 
-    // How close a badge event must be to a door event to count as explaining it (device clocks are not synchronised).
-    private static final long MATCH_WINDOW_SECONDS = 15;
+    // How close a badge event must be to a door event, after correcting for that door's fixed
+    // clock offset, to count as explaining it. Device clocks are not centrally synchronised, but
+    // each device's own offset is stable, so the remaining gap after correction is genuine
+    // latency/sensor delay rather than clock skew, hence a tight window.
+    private static final long MATCH_WINDOW_SECONDS = 5;
 
     // Create a record/class of each DoorEvent
     record DoorEvent(LocalDateTime timestamp, String doorId, String state, boolean badgeRequiredToEnter, boolean badgeRequiredToExit, boolean eventValidated) {}
@@ -35,6 +39,11 @@ public class Main {
 
     // door_id -> badge events at that door, sorted by timestamp
     private static Map<String, List<BadgeEvent>> badgeEventsByDoor = new HashMap<>();
+
+    // door_id -> fixed clock offset in seconds to add to that door's event timestamps so they
+    // align with its badge reader's clock. Computed once as the median gap between each "opened"
+    // event and its nearest granted badge event, over the whole data period.
+    private static Map<String, Long> doorClockOffsetSeconds = new HashMap<>();
 
     public static void main(String[] args) throws IOException {
         // Read the files
@@ -160,10 +169,13 @@ public class Main {
      * Works out, for every door event, whether a badge was needed and whether a matching badge event was found within MATCH_WINDOW_SECONDS of it.
      */
     private static void validateDoorEvents() {
+        computeClockOffsets();
+
         for (Map.Entry<String, List<DoorEvent>> entry : doorEventsByDoor.entrySet()) {
             String doorId = entry.getKey();
             List<DoorEvent> events = entry.getValue();
             List<BadgeEvent> badgesAtDoor = badgeEventsByDoor.getOrDefault(doorId, List.of());
+            long offsetSeconds = doorClockOffsetSeconds.getOrDefault(doorId, 0L);
 
             // Tracks which badge events at this door have already been used to validate a door event, so the same badge cannot validate more than one door event.
             boolean[] badgeUsed = new boolean[badgesAtDoor.size()];
@@ -175,13 +187,82 @@ public class Main {
                 boolean isEnterEvent = event.state().equals("opened");
                 boolean badgeRequired = isEnterEvent && event.badgeRequiredToEnter();
 
+                // Correct for this door's fixed clock offset before comparing against the badge reader's clock.
+                LocalDateTime adjustedTimestamp = event.timestamp().plusSeconds(offsetSeconds);
+
                 boolean eventValidated = !badgeRequired
-                        || claimMatchingBadgeEvent(badgesAtDoor, badgeUsed, event.timestamp());
+                        || claimMatchingBadgeEvent(badgesAtDoor, badgeUsed, adjustedTimestamp);
 
                 events.set(i, new DoorEvent(event.timestamp(), event.doorId(), event.state(),
                         event.badgeRequiredToEnter(), event.badgeRequiredToExit(), eventValidated));
             }
         }
+    }
+
+    /**
+     * Computes each door's fixed clock offset (in seconds) and stores it in
+     * doorClockOffsetSeconds. The offset is the median gap between each "opened" door event and
+     * its nearest granted badge event at that door, over the whole data period. Adding this
+     * offset to a door event's timestamp aligns it with its badge reader's clock.
+     */
+    private static void computeClockOffsets() {
+        for (Map.Entry<String, List<DoorEvent>> entry : doorEventsByDoor.entrySet()) {
+            String doorId = entry.getKey();
+
+            List<BadgeEvent> grantedBadges = badgeEventsByDoor.getOrDefault(doorId, List.of()).stream()
+                    .filter(badge -> badge.result().equals("granted"))
+                    .toList();
+
+            List<Long> gapsSeconds = new ArrayList<>();
+            if (!grantedBadges.isEmpty()) {
+                for (DoorEvent event : entry.getValue()) {
+                    if (!event.state().equals("opened")) {
+                        continue;
+                    }
+                    BadgeEvent nearest = findNearestBadge(grantedBadges, event.timestamp());
+                    gapsSeconds.add(Duration.between(event.timestamp(), nearest.timestamp()).getSeconds());
+                }
+            }
+
+            doorClockOffsetSeconds.put(doorId, gapsSeconds.isEmpty() ? 0L : median(gapsSeconds));
+        }
+    }
+
+    /**
+     * Finds the badge event in the given (timestamp-sorted) list whose timestamp is closest to
+     * the given time, with no window restriction.
+     */
+    private static BadgeEvent findNearestBadge(List<BadgeEvent> badges, LocalDateTime time) {
+        int lo = 0, hi = badges.size() - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (badges.get(mid).timestamp().isBefore(time)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        BadgeEvent best = badges.get(lo);
+        if (lo > 0) {
+            BadgeEvent prev = badges.get(lo - 1);
+            long prevDiff = Math.abs(Duration.between(time, prev.timestamp()).getSeconds());
+            long bestDiff = Math.abs(Duration.between(time, best.timestamp()).getSeconds());
+            if (prevDiff < bestDiff) {
+                best = prev;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * Returns the median of the given values (average of the two middle values if the count is even).
+     */
+    private static long median(List<Long> values) {
+        List<Long> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+        int n = sorted.size();
+        return (n % 2 == 1) ? sorted.get(n / 2) : (sorted.get(n / 2 - 1) + sorted.get(n / 2)) / 2;
     }
 
     /**
