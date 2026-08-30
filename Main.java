@@ -28,8 +28,10 @@ public class Main {
     // latency/sensor delay rather than clock skew, hence a tight window.
     private static final long MATCH_WINDOW_SECONDS = 5;
 
-    // Create a record/class of each DoorEvent
-    record DoorEvent(LocalDateTime timestamp, String doorId, String state, boolean badgeRequiredToEnter, boolean badgeRequiredToExit, boolean eventValidated) {}
+    // Create a record/class of each DoorEvent. direction is "in"/"out" when known (inherited from
+    // a matched badge, or presumed "out" for an unmatched open at a push-bar entry-only door), or
+    // null when a badge was required but none matched (i.e. an unexplained open at an in+out door).
+    record DoorEvent(LocalDateTime timestamp, String doorId, String state, String direction, boolean eventValidated) {}
 
     // Create a record/class of each BadgeEvent
     record BadgeEvent(LocalDateTime timestamp, String doorId, String direction, String cardholderId, String result) {}
@@ -124,10 +126,9 @@ public class Main {
             LocalDateTime timestamp = LocalDateTime.parse(fields[0], TIMESTAMP_FORMAT);
             String doorId = fields[1];
             String state = fields[2];
-            boolean badgeRequiredToExit = IN_OUT_DOORS.contains(doorId);
 
-            // eventValidated is computed later, once badge events are loaded too.
-            DoorEvent event = new DoorEvent(timestamp, doorId, state, true, badgeRequiredToExit, false);
+            // direction and eventValidated are computed later, once badge events are loaded too.
+            DoorEvent event = new DoorEvent(timestamp, doorId, state, null, false);
             doorEventsByDoor.computeIfAbsent(doorId, k -> new ArrayList<>()).add(event);
         }
 
@@ -166,7 +167,15 @@ public class Main {
     }
 
     /**
-     * Works out, for every door event, whether a badge was needed and whether a matching badge event was found within MATCH_WINDOW_SECONDS of it.
+     * Works out, for every "opened" door event, which badge (if any) explains it, and from that
+     * derives a direction and a validated flag:
+     * - If a badge matches, the door event inherits that badge's direction and is validated.
+     * - If no badge matches at an entry-only door, the open is presumed to be a legitimate
+     *   push-bar exit ("out") and is validated, since those doors never log a badge for leaving.
+     * - If no badge matches at an in+out door, direction is left unknown and the event is left
+     *   unvalidated: a badge is required in both directions there, so an unexplained open is a
+     *   genuine anomaly (e.g. tailgating or a forced/propped door), not an expected exit.
+     * "closed" events never require a badge and are always considered validated.
      */
     private static void validateDoorEvents() {
         computeClockOffsets();
@@ -176,6 +185,7 @@ public class Main {
             List<DoorEvent> events = entry.getValue();
             List<BadgeEvent> badgesAtDoor = badgeEventsByDoor.getOrDefault(doorId, List.of());
             long offsetSeconds = doorClockOffsetSeconds.getOrDefault(doorId, 0L);
+            boolean isInOutDoor = IN_OUT_DOORS.contains(doorId);
 
             // Tracks which badge events at this door have already been used to validate a door event, so the same badge cannot validate more than one door event.
             boolean[] badgeUsed = new boolean[badgesAtDoor.size()];
@@ -183,18 +193,29 @@ public class Main {
             for (int i = 0; i < events.size(); i++) {
                 DoorEvent event = events.get(i);
 
-                // The door position sensor only reports opened/closed, not direction, so an "opened" event is treated as the moment someone passes through the door.
-                boolean isEnterEvent = event.state().equals("opened");
-                boolean badgeRequired = isEnterEvent && event.badgeRequiredToEnter();
+                if (!event.state().equals("opened")) {
+                    events.set(i, new DoorEvent(event.timestamp(), event.doorId(), event.state(), null, true));
+                    continue;
+                }
 
                 // Correct for this door's fixed clock offset before comparing against the badge reader's clock.
                 LocalDateTime adjustedTimestamp = event.timestamp().plusSeconds(offsetSeconds);
+                BadgeEvent matchedBadge = claimMatchingBadgeEvent(badgesAtDoor, badgeUsed, adjustedTimestamp);
 
-                boolean eventValidated = !badgeRequired
-                        || claimMatchingBadgeEvent(badgesAtDoor, badgeUsed, adjustedTimestamp);
+                String direction;
+                boolean eventValidated;
+                if (matchedBadge != null) {
+                    direction = matchedBadge.direction();
+                    eventValidated = true;
+                } else if (!isInOutDoor) {
+                    direction = "out";
+                    eventValidated = true;
+                } else {
+                    direction = null;
+                    eventValidated = false;
+                }
 
-                events.set(i, new DoorEvent(event.timestamp(), event.doorId(), event.state(),
-                        event.badgeRequiredToEnter(), event.badgeRequiredToExit(), eventValidated));
+                events.set(i, new DoorEvent(event.timestamp(), event.doorId(), event.state(), direction, eventValidated));
             }
         }
     }
@@ -267,10 +288,11 @@ public class Main {
 
     /**
      * Finds the closest not-yet-used granted badge event within MATCH_WINDOW_SECONDS of the given
-     * door event timestamp, marks it as used, and returns whether a match was found. Once a badge
-     * event has been claimed here it cannot be used to validate any other door event.
+     * door event timestamp, marks it as used, and returns it (or null if no match was found).
+     * Once a badge event has been claimed here it cannot be used to validate any other door
+     * event.
      */
-    private static boolean claimMatchingBadgeEvent(List<BadgeEvent> badgesAtDoor, boolean[] badgeUsed,
+    private static BadgeEvent claimMatchingBadgeEvent(List<BadgeEvent> badgesAtDoor, boolean[] badgeUsed,
             LocalDateTime doorEventTime) {
         int bestIndex = -1;
         long bestDiffSeconds = Long.MAX_VALUE;
@@ -292,9 +314,9 @@ public class Main {
         }
 
         if (bestIndex == -1) {
-            return false;
+            return null;
         }
         badgeUsed[bestIndex] = true;
-        return true;
+        return badgesAtDoor.get(bestIndex);
     }
 }
