@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(java *)",
+      "Bash(rm -rf out)",
+      "Bash(javac Main.java -d out)",
+      "Bash(cd *)",
+      "Bash(javac Drift.java -d .)",
+      "Bash(javac Drift2.java -d .)"
+    ]
+  }
+}
