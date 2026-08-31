@@ -50,9 +50,14 @@ public class Main {
     private static Map<String, Long> doorClockOffsetSeconds = new HashMap<>();
 
     public static void main(String[] args) throws IOException {
+        if (args.length != 2) {
+            System.out.println("Usage: java Main <door_events.csv> <badge_events.csv>");
+            return;
+        }
+
         // Read the files
-        loadDoorEvents(Path.of("door_events.csv"));
-        loadBadgeEvents(Path.of("badge_events.csv"));
+        loadDoorEvents(Path.of(args[0]));
+        loadBadgeEvents(Path.of(args[1]));
         validateDoorEvents();
 
         System.out.println("Doors with door events: " + doorEventsByDoor.size());
